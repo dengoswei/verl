@@ -84,7 +84,7 @@ def _as_row_list(value: Any) -> list[Any] | None:
     """Per-sequence rows from a ragged container, or None if this is not one."""
     if isinstance(value, np.ndarray) and value.dtype == object:
         return list(value)
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return list(value)
     return None
 
