@@ -134,7 +134,9 @@ def ragged_routed_experts_to_nested(routed_experts: Any, cu_seqlens: torch.Tenso
     values = np.concatenate([np.asarray(row) for row in rows], axis=0)
     if not values.flags.writeable:
         values = values.copy()
-    return torch.nested.nested_tensor_from_jagged(torch.from_numpy(values), offsets=cu_seqlens)
+    # Driver rows are host numpy; unpad offsets inherit input_ids.device.
+    values_t = torch.from_numpy(values).to(device=cu_seqlens.device)
+    return torch.nested.nested_tensor_from_jagged(values_t, offsets=cu_seqlens)
 
 
 def has_rollout_routed_experts(batch: Any) -> bool:

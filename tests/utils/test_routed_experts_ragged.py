@@ -80,9 +80,10 @@ def test_cuda_ragged_unpad_matches_dense_and_keeps_sentinel():
     assert dense_out["routed_experts"].is_nested
     assert ragged_out["routed_experts"].is_nested
     assert dense_out["routed_experts"].values().device.type == "cuda"
+    assert ragged_out["routed_experts"].values().device.type == "cuda"
     torch.testing.assert_close(
-        ragged_out["routed_experts"].values().cpu(),
-        dense_out["routed_experts"].values().cpu(),
+        ragged_out["routed_experts"].values(),
+        dense_out["routed_experts"].values(),
     )
     values = dense_out["routed_experts"].values()
     offsets = dense_out["routed_experts"].offsets()
