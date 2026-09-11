@@ -70,37 +70,165 @@ logger.setLevel(logging.INFO)
 visible_devices_keyword = get_visible_devices_keyword()
 
 
+def _get_multimodal_processor_field(mm_inputs: Any, name: str, default: Any = None) -> Any:
+    if isinstance(mm_inputs, dict):
+        return mm_inputs.get(name, default)
+    return getattr(mm_inputs, name, default)
+
+
+def _as_token_id_list(input_ids: Any) -> Optional[list[int]]:
+    if input_ids is None:
+        return None
+    if isinstance(input_ids, torch.Tensor):
+        input_ids = input_ids.flatten().tolist()
+    else:
+        input_ids = list(input_ids)
+    return [int(token_id) for token_id in input_ids]
+
+
+def _record_prompt_logprob_id_aliases(
+    mm_inputs: Any,
+    exact_input_ids: list[int],
+    request_obj: Any,
+    vocab_size: Optional[int],
+    *,
+    materialize_pad_values: bool = False,
+) -> None:
+    """Record positions where SGLang substituted an internal multimodal pad id.
+
+    SGLang keeps hash pads in ``padded_input_ids`` for radix-cache identity, then
+    0.5.14 clips those out-of-vocabulary ids to 0 in prompt-logprob metadata.
+    Logprob values stay positional. Restore only ids recorded at concrete visual
+    offsets; a real vocabulary-tail token is left fail-closed.
+    """
+    aliases: dict[int, set[int]] = {}
+    mm_items = _get_multimodal_processor_field(mm_inputs, "mm_items") or []
+    if materialize_pad_values:
+        for item in mm_items:
+            if getattr(item, "pad_value", None) is None:
+                set_pad_value = getattr(item, "set_pad_value", None)
+                if callable(set_pad_value):
+                    set_pad_value()
+    multimodal_positions = {
+        position
+        for item in mm_items
+        for start, end in (item.offsets or [])
+        for position in range(int(start), int(end) + 1)
+    }
+    padded_input_ids = _as_token_id_list(_get_multimodal_processor_field(mm_inputs, "padded_input_ids"))
+    exact_input_ids = _as_token_id_list(exact_input_ids)
+    if exact_input_ids is not None and (padded_input_ids is None or len(padded_input_ids) != len(exact_input_ids)):
+        if mm_items and all(getattr(item, "pad_value", None) is not None for item in mm_items):
+            padded_input_ids = list(exact_input_ids)
+            for item in mm_items:
+                for start, end in item.offsets or []:
+                    start, end = int(start), int(end)
+                    padded_input_ids[start : end + 1] = [int(item.pad_value)] * (end - start + 1)
+    if padded_input_ids is not None and exact_input_ids is not None and len(padded_input_ids) == len(exact_input_ids):
+        for position, (exact_id, padded_id) in enumerate(zip(exact_input_ids, padded_input_ids, strict=True)):
+            if position not in multimodal_positions or padded_id == exact_id:
+                continue
+            accepted = {padded_id}
+            if vocab_size is not None and padded_id >= vocab_size - 1:
+                accepted.add(0)
+            aliases[position] = accepted
+    request_obj._verl_prompt_logprob_id_aliases = aliases
+
+
+def _install_prompt_logprob_id_alias_recording(tokenizer_manager: Any, vocab_size: Optional[int]) -> bool:
+    """Record pad-id aliases after SGLang tokenizes a multimodal prompt-logprob request."""
+    original = getattr(tokenizer_manager, "_tokenize_one_request", None)
+    if not callable(original) or getattr(tokenizer_manager, "_verl_prompt_logprob_id_aliases", False):
+        return False
+
+    async def tokenize_one_request_with_aliases(request_obj):
+        exact_input_ids = _as_token_id_list(getattr(request_obj, "input_ids", None))
+        tokenized_request = await original(request_obj)
+        mm_inputs = getattr(tokenized_request, "mm_inputs", None)
+        if mm_inputs is None:
+            mm_inputs = getattr(tokenized_request, "image_inputs", None)
+        if exact_input_ids is not None and mm_inputs is not None:
+            _record_prompt_logprob_id_aliases(
+                mm_inputs,
+                exact_input_ids,
+                request_obj,
+                vocab_size,
+                materialize_pad_values=True,
+            )
+        return tokenized_request
+
+    tokenizer_manager._tokenize_one_request = tokenize_one_request_with_aliases
+    tokenizer_manager._verl_prompt_logprob_id_aliases = True
+    return True
+
+
 def _extract_prompt_logprobs_sglang(
     meta_info: dict,
     num_prompt_logprobs: int,
-    sequence_length: int,
+    sequence_ids: Any,
     result_dict: dict[str, list],
-) -> None:
+    prompt_logprob_id_aliases: Optional[dict[int, set[int]]] = None,
+) -> int:
     """Shape SGLang input-logprobs into the vLLM ``extract_prompt_logprobs`` contract.
-    Populates ``result_dict`` with two ``[sequence_length, max(num_prompt_logprobs, 1)]``
-    lists — ``prompt_ids`` and ``prompt_logprobs`` — so the distillation teacher
-    consumer in ``teacher_manager.AsyncTeacherLLMServerManager`` can treat vLLM and
-    SGLang teachers interchangeably.
-    SGLang returns input logprobs with length ``S == len(input_ids)`` whose first
-    entry has ``logprob=None`` (no predicting context). That matches the vLLM
-    convention, so we skip entry 0 and append a trailing dummy row to keep the
-    total length equal to the consumer's ``len(sequence_ids)`` assertion.
+
+    SGLang may echo an internal multimodal pad id (or 0 after 0.5.14 clips it).
+    Restore only aliases recorded at concrete visual offsets for this request.
     """
+    sequence_ids = _as_token_id_list(sequence_ids)
+    assert sequence_ids is not None and sequence_ids, "Prompt-logprob extraction requires a non-empty sequence."
+    sequence_length = len(sequence_ids)
     input_token_logprobs = meta_info.get("input_token_logprobs") or []
     if num_prompt_logprobs > 0:
         input_top_logprobs = meta_info.get("input_top_logprobs") or []
+        assert len(input_top_logprobs) == len(input_token_logprobs), (
+            f"SGLang input_top_logprobs length ({len(input_top_logprobs)}) does not match "
+            f"input_token_logprobs length ({len(input_token_logprobs)})."
+        )
+
+    restored_aliases = 0
+
+    def align_returned_ids(returned_ids: list[int], expected_ids: list[int], offset: int) -> list[int]:
+        nonlocal restored_aliases
+        normalized_ids: list[int] = []
+        for local_index, (expected_id, returned_id) in enumerate(zip(expected_ids, returned_ids, strict=True)):
+            absolute_index = local_index + offset
+            if returned_id == expected_id:
+                normalized_ids.append(returned_id)
+            elif returned_id in (prompt_logprob_id_aliases or {}).get(absolute_index, set()):
+                normalized_ids.append(expected_id)
+                restored_aliases += 1
+            else:
+                raise AssertionError(
+                    "SGLang prompt-logprob token IDs do not match the request: "
+                    f"first_mismatch_index={absolute_index}, expected_id={expected_id}, "
+                    f"returned_id={returned_id}."
+                )
+        return normalized_ids
+
+    if len(input_token_logprobs) == sequence_length:
+        returned_ids = [int(entry[1]) for entry in input_token_logprobs]
+        normalized_returned_ids = align_returned_ids(returned_ids, sequence_ids, offset=0)
+        scored_positions = range(1, sequence_length)
+    elif len(input_token_logprobs) == sequence_length - 1:
+        returned_ids = [int(entry[1]) for entry in input_token_logprobs]
+        normalized_returned_ids = align_returned_ids(returned_ids, sequence_ids[1:], offset=1)
+        scored_positions = range(sequence_length - 1)
+    else:
+        raise AssertionError(
+            f"SGLang input_token_logprobs length ({len(input_token_logprobs)}) does not match sequence length "
+            f"({sequence_length}) or aligned omitted-first length ({sequence_length - 1})."
+        )
+
     prompt_ids_ls: list[list[int]] = []
     prompt_logprobs_ls: list[list[float]] = []
-    # Entry 0 has logprob=None (no predicting context); skip it, matching vLLM.
-    for position in range(1, len(input_token_logprobs)):
+    for position in scored_positions:
+        meta_index = position if len(input_token_logprobs) == sequence_length else position
         if num_prompt_logprobs == 0:
-            logprob, token_id, _ = input_token_logprobs[position]
-            prompt_ids_ls.append([int(token_id)])
+            logprob, _, _ = input_token_logprobs[meta_index]
+            prompt_ids_ls.append([normalized_returned_ids[meta_index]])
             prompt_logprobs_ls.append([float(logprob)])
         else:
-            top_entries = input_top_logprobs[position]
-            # SGLang returns ranked best-first; we preserve that ordering so rank
-            # 0 is the top-1 token, matching the vLLM extractor's rank-1 slot.
+            top_entries = input_top_logprobs[meta_index]
             ids = [int(tok_id) for _, tok_id, _ in top_entries]
             logprobs = [float(logprob) for logprob, _, _ in top_entries]
             assert len(ids) == num_prompt_logprobs, (
@@ -108,7 +236,6 @@ def _extract_prompt_logprobs_sglang(
             )
             prompt_ids_ls.append(ids)
             prompt_logprobs_ls.append(logprobs)
-    # Trailing dummy row so total length == len(sequence_ids), matching vLLM.
     pad_width = max(num_prompt_logprobs, 1)
     prompt_ids_ls.append([0] * pad_width)
     prompt_logprobs_ls.append([0.0] * pad_width)
@@ -118,6 +245,7 @@ def _extract_prompt_logprobs_sglang(
     )
     result_dict["prompt_ids"] = prompt_ids_ls
     result_dict["prompt_logprobs"] = prompt_logprobs_ls
+    return restored_aliases
 
 
 class SGLangHttpServer:
@@ -476,6 +604,12 @@ class SGLangHttpServer:
 
         self._server_port, self._server_task = await run_uvicorn(app, server_args, self._server_address)
         self.tokenizer_manager.server_status = ServerStatus.Up
+        tokenizer = getattr(self.model_config, "tokenizer", None)
+        try:
+            vocab_size = len(tokenizer) if tokenizer is not None else None
+        except TypeError:
+            vocab_size = None
+        _install_prompt_logprob_id_alias_recording(self.tokenizer_manager, vocab_size)
 
     async def wake_up(self):
         if self.node_rank != 0:
@@ -701,8 +835,9 @@ class SGLangHttpServer:
             _extract_prompt_logprobs_sglang(
                 meta_info=meta_info,
                 num_prompt_logprobs=prompt_logprobs,
-                sequence_length=len(prompt_ids),
+                sequence_ids=prompt_ids,
                 result_dict=extra_fields,
+                prompt_logprob_id_aliases=getattr(generate_request, "_verl_prompt_logprob_id_aliases", None),
             )
 
         # Re-key backend spec-decoding stats to the rollout-common names.
