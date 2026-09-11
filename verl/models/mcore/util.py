@@ -848,7 +848,7 @@ def postprocess_bshd_engine(
     return output_new_tensor
 
 
-def build_vlm_attn_mask_thd(input_ids: torch.Tensor, pad_token_id: int = None):
+def build_vlm_attn_mask_thd(input_ids: torch.Tensor, pad_token_id: int = None, sequence_parallel: bool = False):
     seqlens_in_batch = input_ids.offsets().diff()
 
     # Align to TP/CP so ``combined_embeddings`` is divisible by tp_size before
@@ -861,7 +861,17 @@ def build_vlm_attn_mask_thd(input_ids: torch.Tensor, pad_token_id: int = None):
         max_seqlen += (align_size - max_seqlen % align_size) % align_size
 
     batch_size = input_ids.shape[0]
-    input_ids_with_pad = input_ids.to_padded_tensor(pad_token_id, output_size=(batch_size, max_seqlen))
+    pad_id = 0 if pad_token_id is None else pad_token_id
+    input_ids_with_pad = input_ids.to_padded_tensor(pad_id, output_size=(batch_size, max_seqlen))
+    # Qwen3-VL packs-then-scatters only when B>1. A one-row SP batch would scatter dim0=1.
+    if sequence_parallel and batch_size == 1:
+        dummy = torch.full(
+            (1, max_seqlen),
+            pad_id,
+            dtype=input_ids_with_pad.dtype,
+            device=input_ids_with_pad.device,
+        )
+        input_ids_with_pad = torch.cat([input_ids_with_pad, dummy], dim=0)
     attention_mask = torch.zeros_like(input_ids_with_pad, dtype=torch.bool)
     for i, seqlen in enumerate(seqlens_in_batch):
         attention_mask[i, :seqlen] = True
